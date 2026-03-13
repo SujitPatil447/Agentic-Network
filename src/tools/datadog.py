@@ -1,4 +1,4 @@
-"""Datadog tools for the Triage Agent — search logs, list monitors, get error details."""
+"""Datadog tools for the Triage Agent — search logs, list monitors, get error details, search events."""
 
 import time
 
@@ -8,6 +8,7 @@ from datadog_api_client.v2.model.logs_list_request import LogsListRequest
 from datadog_api_client.v2.model.logs_query_filter import LogsQueryFilter
 from datadog_api_client.v2.model.logs_sort import LogsSort
 from datadog_api_client.v1.api.monitors_api import MonitorsApi as MonitorsApiV1
+from datadog_api_client.v1.api.events_api import EventsApi
 from langchain_core.tools import tool
 
 from src.config import settings
@@ -145,9 +146,59 @@ def get_monitor_details(monitor_id: int) -> str:
     )
 
 
+@tool
+def search_events(cluster: str, timeframe: str = "1h", sources: str = "") -> str:
+    """Search Datadog events for deployments, restarts, scaling, config changes, and alerts.
+
+    Use this to correlate production issues with recent changes or deploys.
+
+    Args:
+        cluster: Kubernetes cluster to scope the event search.
+        timeframe: How far back to search — e.g. '1h', '6h', '1d'. Default '1h'.
+        sources: Comma-separated event sources to filter (e.g. 'kubernetes,docker,chef'). Leave empty for all.
+    """
+    from datetime import datetime, timedelta
+
+    config = _get_dd_config()
+
+    time_deltas = {"1h": 3600, "6h": 21600, "1d": 86400, "7d": 604800}
+    delta_secs = time_deltas.get(timeframe, 3600)
+
+    now = int(datetime.now().timestamp())
+    start = now - delta_secs
+
+    _rate_limit_wait()
+    with ApiClient(config) as api_client:
+        api = EventsApi(api_client)
+        kwargs = {"start": start, "end": now, "tags": f"kube_cluster_name:{cluster}"}
+        if sources:
+            kwargs["sources"] = sources
+        response = api.list_events(**kwargs)
+
+    events = response.events if hasattr(response, "events") else []
+
+    if not events:
+        return f"No events found for cluster '{cluster}' in the last {timeframe}."
+
+    lines = [f"Found {len(events)} event(s) in the last {timeframe}:\n"]
+    for i, evt in enumerate(events[:30], 1):
+        title = getattr(evt, "title", "(no title)")
+        source = getattr(evt, "source", "unknown")
+        date = getattr(evt, "date_happened", "")
+        text = getattr(evt, "text", "")
+        lines.append(
+            f"  {i}. [{source}] {title}\n"
+            f"     Time: {date}\n"
+            f"     {str(text)[:200]}"
+        )
+
+    return "\n".join(lines)
+
+
 # Collect all Datadog tools
 datadog_tools = [
     search_logs,
     list_triggered_monitors,
     get_monitor_details,
+    search_events,
 ]

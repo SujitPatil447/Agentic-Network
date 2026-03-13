@@ -27,6 +27,8 @@ class Issue(TypedDict, total=False):
     severity: str
     service: str
     summary: str
+    evidence: str
+    mitigation: str
     accepted: bool
 
 
@@ -44,48 +46,85 @@ class TriageState(TypedDict, total=False):
 # ── System prompts ────────────────────────────────────────────────────────────
 
 INVESTIGATE_PROMPT = """\
-You are a TRIAGE AGENT investigating production issues.
+You are a PRODUCTION TRIAGE AGENT performing structured incident investigation.
 
-You have access to Datadog tools to search logs, list triggered monitors, and
-get monitor details.
+You have access to Datadog tools: search_logs, list_triggered_monitors,
+get_monitor_details, and search_events.
 
-IMPORTANT: Every Datadog tool call MUST include the 'cluster' parameter provided
-by the user. Never omit the cluster — it scopes queries to the correct
-Kubernetes cluster and avoids pulling data from unrelated projects.
+## Constraints
+- Every Datadog tool call MUST include the 'cluster' parameter. Never omit it.
+- Always use the timeframe provided by the user when searching logs.
+- DO NOT invent data, IDs, tags, or conclusions not supported by actual Datadog results.
+- NEVER jump to root cause from a single log line or single monitor — validate
+  with at least two signals whenever possible.
+- Explicitly label each conclusion as FACT, LIKELY ROOT CAUSE, or HYPOTHESIS.
 
-Your task:
-1. Use the Datadog tools to investigate the query/area provided by the user.
-   Always pass the cluster value in every tool call.
-   Always use the timeframe provided by the user when searching logs.
-2. Identify distinct issues from the data.
-3. Produce your output as **valid JSON only** (no markdown fences), with this schema:
-   {{
-     "report": "A paragraph summarising what you found",
-     "issues": [
-       {{
-         "id": 1,
-         "title": "Short issue title",
-         "severity": "high | medium | low",
-         "service": "affected-service-name",
-         "summary": "Detailed description of the issue"
-       }}
-     ]
-   }}
+## Investigation Workflow
 
-Be precise and ground every finding in actual log/monitor data from the tools.
-If nothing is found, return an empty issues list.
+### Step 1 — Check triggered monitors
+Call list_triggered_monitors to see if any monitors are alerting/warning.
+If monitors are found, use get_monitor_details for the most relevant ones.
+
+### Step 2 — Search error logs
+Call search_logs with the user's query. Look for:
+  - Recurring error patterns (same exception, same status code)
+  - Affected services and endpoints
+  - Error frequency and timing
+
+### Step 3 — Check for recent deployments/changes
+Call search_events to look for deploy, restart, scaling, or config-change events
+in the same time window. Correlate event timestamps with the onset of errors.
+
+### Step 4 — Slice by dimensions
+If errors are found, make additional search_logs calls to narrow down:
+  - By specific service (service:<name>)
+  - By status code (e.g. status:error @http.status_code:500)
+  - By host or pod if a pattern suggests one instance is unhealthy
+Keep queries minimal to stay within rate limits.
+
+### Step 5 — Build hypotheses & validate
+For each issue found:
+  - State what was observed (FACT)
+  - Propose likely cause (HYPOTHESIS or LIKELY ROOT CAUSE)
+  - Note what evidence supports or weakens the hypothesis
+
+## Output Format
+Produce your output as **valid JSON only** (no markdown fences), with this schema:
+{{
+  "executive_summary": "What is broken, since when, and severity",
+  "affected_scope": "Environment, services, versions, endpoints affected",
+  "evidence": "Key metrics, log patterns, monitors, events that support findings",
+  "report": "Detailed narrative of the investigation",
+  "issues": [
+    {{
+      "id": 1,
+      "title": "Short issue title",
+      "severity": "high | medium | low",
+      "service": "affected-service-name",
+      "summary": "Detailed description including root cause status (fact/hypothesis/likely)",
+      "evidence": "Specific log messages, monitor names, or event data supporting this issue",
+      "mitigation": "Suggested immediate action (rollback, restart, isolate, etc.)"
+    }}
+  ],
+  "observability_gaps": "Missing monitors, tags, dashboards, or deployment markers noticed"
+}}
+
+Be precise and ground every finding in actual data from the tools.
+If nothing is found, return an empty issues list with a brief report.
 """
 
 CREATE_TICKETS_PROMPT = """\
-You are a TRIAGE AGENT creating Jira tickets for accepted issues.
+You are a TRIAGE AGENT creating Jira tickets for accepted production issues.
 
 For EACH issue provided, create a Jira ticket using the create_jira_ticket tool with:
 - summary: The issue title
 - description: A well-formatted description including:
-  * Root cause / what was observed
-  * Affected service
-  * Severity
-  * Full summary from the investigation
+  * Executive Summary — What is broken and severity
+  * Evidence — Specific log messages, monitor alerts, events that confirm the issue
+  * Root Cause Analysis — What was found (fact vs hypothesis)
+  * Affected Service & Scope
+  * Immediate Mitigation — Suggested actions (rollback, restart, isolate, etc.)
+  * Permanent Fix — What should be done long-term
 - issue_type: "Bug"
 - priority: Map severity → Jira priority (high→High, medium→Medium, low→Low)
 - labels: "triage-agent,{service}"
@@ -132,18 +171,36 @@ def investigate(state: TriageState) -> Command:
                 severity=item.get("severity", "medium"),
                 service=item.get("service", ""),
                 summary=item.get("summary", ""),
+                evidence=item.get("evidence", ""),
+                mitigation=item.get("mitigation", ""),
                 accepted=False,
             )
         )
 
     return Command(
         update={
-            "investigation_report": parsed.get("report", raw),
+            "investigation_report": _build_report(parsed),
             "issues": issues,
             "status": "awaiting_human_review",
         },
         goto="human_review",
     )
+
+
+def _build_report(parsed: dict) -> str:
+    """Build a human-readable report from the structured investigation output."""
+    parts = []
+    if parsed.get("executive_summary"):
+        parts.append(f"**Executive Summary:** {parsed['executive_summary']}")
+    if parsed.get("affected_scope"):
+        parts.append(f"**Affected Scope:** {parsed['affected_scope']}")
+    if parsed.get("evidence"):
+        parts.append(f"**Evidence:** {parsed['evidence']}")
+    if parsed.get("report"):
+        parts.append(f"\n{parsed['report']}")
+    if parsed.get("observability_gaps"):
+        parts.append(f"**Observability Gaps:** {parsed['observability_gaps']}")
+    return "\n\n".join(parts) if parts else parsed.get("report", "No report generated.")
 
 
 def human_review(state: TriageState) -> Command:
@@ -219,7 +276,9 @@ def create_tickets(state: TriageState) -> Command:
 
     issues_text = "\n".join(
         f"- Issue #{i['id']}: {i['title']} | Severity: {i['severity']} | "
-        f"Service: {i['service']} | Details: {i['summary']}"
+        f"Service: {i['service']} | Details: {i['summary']}\n"
+        f"  Evidence: {i.get('evidence', 'N/A')}\n"
+        f"  Mitigation: {i.get('mitigation', 'N/A')}"
         for i in accepted
     )
 
